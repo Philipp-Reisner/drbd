@@ -1202,6 +1202,7 @@ struct drbd_peer_device {
 	struct {/* sender todo per peer_device */
 		bool was_ahead;
 	} todo;
+	union drbd_state connect_state;
 };
 
 struct submit_worker {

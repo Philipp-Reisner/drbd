@@ -4944,6 +4944,29 @@ static void __change_cstate_and_outdate(struct drbd_connection *connection,
 	}
 }
 
+void apply_connect(struct drbd_connection *connection, bool commit)
+{
+	struct drbd_peer_device *peer_device;
+	int vnr;
+
+	idr_for_each_entry(&connection->peer_devices, peer_device, vnr) {
+		struct drbd_device *device = peer_device->device;
+		union drbd_state s = peer_device->connect_state;
+
+		if (s.disk != D_MASK)
+			__change_disk_state(device, s.disk);
+		if (device->disk_state[NOW] != D_NEGOTIATING)
+			__change_repl_state(peer_device, s.conn);
+		__change_peer_disk_state(peer_device, s.pdsk);
+		__change_resync_susp_peer(peer_device, s.peer_isp);
+
+		if (commit) {
+			set_bit(INITIAL_STATE_PROCESSED, &peer_device->flags);
+			clear_bit(DISCARD_MY_DATA, &peer_device->flags);
+		}
+	}
+}
+
 struct change_cstate_context {
 	struct change_context context;
 	struct drbd_connection *connection;
@@ -4954,12 +4977,13 @@ static bool do_change_cstate(struct change_context *context, enum change_phase p
 {
 	struct change_cstate_context *cstate_context =
 		container_of(context, struct change_cstate_context, context);
+	struct drbd_connection *connection = cstate_context->connection;
 
 	if (phase == PH_PREPARE) {
 		cstate_context->outdate_what = OUTDATE_NOTHING;
 		if (context->val.conn == C_DISCONNECTING && !(context->flags & CS_HARD)) {
 			cstate_context->outdate_what =
-				outdate_on_disconnect(cstate_context->connection);
+				outdate_on_disconnect(connection);
 			switch(cstate_context->outdate_what) {
 			case OUTDATE_DISKS:
 				context->mask.disk = disk_MASK;
@@ -4974,9 +4998,13 @@ static bool do_change_cstate(struct change_context *context, enum change_phase p
 			}
 		}
 	}
-	__change_cstate_and_outdate(cstate_context->connection,
+	__change_cstate_and_outdate(connection,
 				    context->val.conn,
 				    cstate_context->outdate_what);
+
+	if (context->val.conn == C_CONNECTED &&
+	    connection->agreed_pro_version >= 117)
+		apply_connect(connection, phase == PH_COMMIT);
 
 	if (phase == PH_COMMIT) {
 		struct drbd_resource *resource = context->resource;
@@ -4991,7 +5019,7 @@ static bool do_change_cstate(struct change_context *context, enum change_phase p
 	return phase != PH_PREPARE ||
 	       context->val.conn == C_CONNECTED ||
 	       (context->val.conn == C_DISCONNECTING &&
-		connection_has_connected_peer_devices(cstate_context->connection));
+		connection_has_connected_peer_devices(connection));
 }
 
 /**

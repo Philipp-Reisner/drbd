@@ -688,24 +688,10 @@ int drbd_connected(struct drbd_peer_device *peer_device)
 	return err;
 }
 
-void connect_timer_fn(struct timer_list *t)
-{
-	struct drbd_connection *connection = from_timer(connection, t, connect_timer);
-	struct drbd_resource *resource = connection->resource;
-	unsigned long irq_flags;
-
-	spin_lock_irqsave(&resource->req_lock, irq_flags);
-	drbd_queue_work(&connection->sender_work, &connection->connect_timer_work);
-	spin_unlock_irqrestore(&resource->req_lock, irq_flags);
-}
-
 static void conn_connect2(struct drbd_connection *connection)
 {
 	struct drbd_peer_device *peer_device;
 	int vnr;
-
-	atomic_set(&connection->ap_in_flight, 0);
-	atomic_set(&connection->rs_in_flight, 0);
 
 	rcu_read_lock();
 	idr_for_each_entry(&connection->peer_devices, peer_device, vnr) {
@@ -724,6 +710,36 @@ static void conn_connect2(struct drbd_connection *connection)
 		kref_put(&device->kref, drbd_destroy_device);
 	}
 	rcu_read_unlock();
+
+}
+
+static bool initial_states_received(struct drbd_connection *connection)
+{
+	struct drbd_peer_device *peer_device;
+	int vnr;
+	bool rv = true;
+
+	rcu_read_lock();
+	idr_for_each_entry(&connection->peer_devices, peer_device, vnr) {
+		if (!test_bit(INITIAL_STATE_RECEIVED, &peer_device->flags)) {
+			rv = false;
+			break;
+		}
+	}
+	rcu_read_unlock();
+
+	return rv;
+}
+
+void connect_timer_fn(struct timer_list *t)
+{
+	struct drbd_connection *connection = from_timer(connection, t, connect_timer);
+	struct drbd_resource *resource = connection->resource;
+	unsigned long irq_flags;
+
+	spin_lock_irqsave(&resource->req_lock, irq_flags);
+	drbd_queue_work(&connection->sender_work, &connection->connect_timer_work);
+	spin_unlock_irqrestore(&resource->req_lock, irq_flags);
 }
 
 static int connect_work(struct drbd_work *work, int cancel)
@@ -737,6 +753,19 @@ static int connect_work(struct drbd_work *work, int cancel)
 	if (connection->cstate[NOW] != C_CONNECTING)
 		goto out_put;
 
+	if (connection->agreed_pro_version >= 117) {
+		struct net_conf *nc;
+
+		rcu_read_lock();
+		nc = rcu_dereference(connection->transport.net_conf);
+		t = nc->ping_timeo * 4 * HZ/10;
+		rcu_read_unlock();
+		wait_event_interruptible_timeout(connection->ee_wait,
+						 initial_states_received(connection),
+						 t);
+	}
+
+	t = resource->res_opts.auto_promote_timeout * HZ / 10;
 	do {
 		rv = change_cstate(connection, C_CONNECTED, CS_SERIALIZE | CS_VERBOSE | CS_DONT_RETRY);
 		if (rv != SS_PRIMARY_READER)
@@ -753,7 +782,8 @@ static int connect_work(struct drbd_work *work, int cancel)
 	} while (t > 0);
 
 	if (rv >= SS_SUCCESS) {
-		conn_connect2(connection);
+		if (connection->agreed_pro_version < 117)
+			conn_connect2(connection);
 	} else if (rv == SS_TIMEOUT || rv == SS_CONCURRENT_ST_CHG) {
 		if (connection->cstate[NOW] != C_CONNECTING)
 			goto out_put;
@@ -897,7 +927,13 @@ start:
 		goto retry;
 	}
 
+	atomic_set(&connection->ap_in_flight, 0);
+	atomic_set(&connection->rs_in_flight, 0);
+
 	if (connection->agreed_pro_version >= 110) {
+		if (connection->agreed_pro_version >= 117)
+			conn_connect2(connection);
+
 		if (resource->res_opts.node_id < connection->peer_node_id) {
 			kref_get(&connection->kref);
 			kref_debug_get(&connection->kref_debug, 11);
@@ -5648,6 +5684,10 @@ change_connection_state(struct drbd_connection *connection,
 	val = convert_state(val);
 retry:
 	begin_state_change(resource, &irq_flags, flags & ~CS_VERBOSE);
+	if (mask.conn && val.conn == C_CONNECTED &&
+	    connection->agreed_pro_version >= 117)
+		apply_connect(connection, flags & CS_PREPARED);
+
 	idr_for_each_entry(&connection->peer_devices, peer_device, vnr) {
 		union drbd_state l_mask;
 		l_mask = is_disconnect ? sanitize_outdate(peer_device, mask, val) : mask;
@@ -6975,7 +7015,19 @@ static int receive_state(struct drbd_connection *connection, struct packet_info 
 		return -EIO;
 	}
 
-	set_bit(INITIAL_STATE_RECEIVED, &peer_device->flags);
+	if (connection->cstate[NOW] == C_CONNECTING) {
+		/* Since protocol 117 state comes before change on the cstate */
+		peer_device->connect_state = (union drbd_state)
+			{ { .disk = new_disk_state,
+			    .conn = new_repl_state,
+			    .peer = peer_state.role,
+			    .pdsk = peer_disk_state,
+			    .peer_isp = peer_state.aftr_isp | peer_state.user_isp } };
+
+		set_bit(INITIAL_STATE_RECEIVED, &peer_device->flags);
+		wake_up(&connection->ee_wait);
+		return 0;
+	}
 
 	spin_lock_irq(&resource->req_lock);
 	begin_state_change_locked(resource, begin_state_chg_flags);
@@ -7000,7 +7052,7 @@ static int receive_state(struct drbd_connection *connection, struct packet_info 
 
 	rv = end_state_change_locked(resource);
 	new_repl_state = peer_device->repl_state[NOW];
-	set_bit(INITIAL_STATE_PROCESSED, &peer_device->flags);
+	set_bit(INITIAL_STATE_PROCESSED, &peer_device->flags); /* Only relevant for agreed_pro_version < 117 */
 	spin_unlock_irq(&resource->req_lock);
 
 	if (rv < SS_SUCCESS)
@@ -7017,7 +7069,7 @@ static int receive_state(struct drbd_connection *connection, struct packet_info 
 		}
 	}
 
-	clear_bit(DISCARD_MY_DATA, &peer_device->flags);
+	clear_bit(DISCARD_MY_DATA, &peer_device->flags); /* Only relevant for agreed_pro_version < 117 */
 
 	if (try_to_get_resync)
 		try_to_get_resynced(device);
