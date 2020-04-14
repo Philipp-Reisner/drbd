@@ -1560,7 +1560,7 @@ static enum drbd_state_rv __is_valid_soft_transition(struct drbd_resource *resou
 
 			idr_for_each_entry(&connection->peer_devices, peer_device, vnr) {
 				if (test_bit(INITIAL_STATE_SENT, &peer_device->flags) &&
-				    !test_bit(INITIAL_STATE_RECEIVED, &peer_device->flags))
+				    !test_bit(INITIAL_STATE_PROCESSED, &peer_device->flags))
 					return SS_IN_TRANSIENT_STATE;
 			}
 		}
@@ -2637,7 +2637,7 @@ static void finish_state_change(struct drbd_resource *resource, struct completio
 
 			idr_for_each_entry(&connection->peer_devices, peer_device, vnr) {
 				clear_bit(INITIAL_STATE_SENT, &peer_device->flags);
-				clear_bit(INITIAL_STATE_RECEIVED, &peer_device->flags);
+				clear_bit(INITIAL_STATE_PROCESSED, &peer_device->flags);
 			}
 		}
 
