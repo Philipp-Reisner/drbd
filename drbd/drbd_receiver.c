@@ -875,6 +875,7 @@ start:
 	rcu_read_lock();
 	idr_for_each_entry(&connection->peer_devices, peer_device, vnr) {
 		clear_bit(INITIAL_STATE_SENT, &peer_device->flags);
+		clear_bit(INITIAL_STATE_RECEIVED, &peer_device->flags);
 		clear_bit(INITIAL_STATE_PROCESSED, &peer_device->flags);
 	}
 	idr_for_each_entry(&connection->peer_devices, peer_device, vnr) {
@@ -3821,7 +3822,7 @@ static enum sync_strategy drbd_uuid_compare(struct drbd_peer_device *peer_device
 
 	initial_handshake =
 		test_bit(INITIAL_STATE_SENT, &peer_device->flags) &&
-		!test_bit(INITIAL_STATE_PROCESSED, &peer_device->flags);
+		!test_bit(INITIAL_STATE_RECEIVED, &peer_device->flags);
 	uuid_matches_initial =
 		self == (peer_device->comm_current_uuid & ~UUID_PRIMARY) &&
 		local_uuid_flags == peer_device->comm_uuid_flags;
@@ -6775,7 +6776,7 @@ static int receive_state(struct drbd_connection *connection, struct packet_info 
 	if (old_peer_state.conn <= C_TEAR_DOWN)
 		return -ECONNRESET;
 
-	if (!test_bit(INITIAL_STATE_PROCESSED, &peer_device->flags) &&
+	if (!test_bit(INITIAL_STATE_RECEIVED, &peer_device->flags) &&
 	    peer_state.role == R_PRIMARY && peer_device->uuid_flags & UUID_FLAG_STABLE)
 		check_resync_source(device, peer_device->uuid_node_mask);
 
@@ -6954,6 +6955,8 @@ static int receive_state(struct drbd_connection *connection, struct packet_info 
 	   diskless case again. Releasing uuid_sem here */
 	if (test_and_clear_bit(HOLDING_UUID_READ_LOCK, &peer_device->flags))
 		up_read_non_owner(&device->uuid_sem);
+
+	set_bit(INITIAL_STATE_RECEIVED, &peer_device->flags);
 
 	spin_lock_irq(&resource->req_lock);
 	begin_state_change_locked(resource, begin_state_chg_flags);
