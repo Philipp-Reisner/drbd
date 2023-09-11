@@ -573,6 +573,9 @@ int main(int argc, char **argv)
 	patch(1, "__bio_add_page", true, false,
 	      COMPAT_HAVE___BIO_ADD_PAGE, "present");
 
+	patch(1, "tasklet_setup", true, false,
+	      COMPAT_HAVE_TASKLET_SETUP, "present");
+
 /* #define BLKDEV_ISSUE_ZEROOUT_EXPORTED */
 /* #define BLKDEV_ZERO_NOUNMAP */
 
