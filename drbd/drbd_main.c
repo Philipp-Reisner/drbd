@@ -2667,9 +2667,10 @@ static enum ioc_rv inc_open_count(struct drbd_device *device, blk_mode_t mode)
 		r = IOC_ABORT;
 	else if (!resource->remote_state_change) {
 		r = IOC_OK;
-		device->open_cnt++;
-		if (mode & BLK_OPEN_WRITE)
-			device->writable = true;
+		if (mode & FMODE_WRITE)
+			device->open_rw_cnt++;
+		else
+			device->open_ro_cnt++;
 	}
 	read_unlock_irq(&resource->state_rwlock);
 
@@ -2748,7 +2749,6 @@ static int drbd_open(struct gendisk *gd, blk_mode_t mode)
 	struct drbd_device *device = gd->private_data;
 	struct drbd_resource *resource = device->resource;
 	long timeout = resource->res_opts.auto_promote_timeout * HZ / 10;
-	bool was_writable;
 	bool did_auto_promote = false;
 	enum ioc_rv r;
 	int err = 0;
@@ -2773,7 +2773,6 @@ static int drbd_open(struct gendisk *gd, blk_mode_t mode)
 	kref_debug_get(&device->kref_debug, 3);
 
 	mutex_lock(&resource->open_release);
-	was_writable = device->writable;
 
 	timeout = wait_event_interruptible_timeout(resource->twopc_wait,
 						   (r = inc_open_count(device, mode)),
@@ -2840,7 +2839,7 @@ out:
 	if (!err) {
 		add_opener(device, did_auto_promote);
 		/* Only interested in first open and last close. */
-		if (device->open_cnt == 1) {
+		if (device->open_ro_cnt + device->open_rw_cnt == 1) {
 			struct device_info info;
 
 			device_to_info(&info, device);
@@ -2848,8 +2847,7 @@ out:
 			notify_device_state(NULL, 0, device, &info, NOTIFY_CHANGE);
 			mutex_unlock(&notification_mutex);
 		}
-	} else
-		device->writable = was_writable;
+	}
 
 	mutex_unlock(&resource->open_release);
 	if (err) {
@@ -2868,10 +2866,8 @@ void drbd_open_counts(struct drbd_resource *resource, int *rw_count_ptr, int *ro
 
 	rcu_read_lock();
 	idr_for_each_entry(&resource->devices, device, vnr) {
-		if (device->writable)
-			rw_count += device->open_cnt;
-		else
-			ro_count += device->open_cnt;
+		rw_count += device->open_rw_cnt;
+		ro_count += device->open_ro_cnt;
 	}
 	rcu_read_unlock();
 	*rw_count_ptr = rw_count;
@@ -2939,30 +2935,28 @@ static void drbd_release(struct gendisk *gd)
 {
 	struct drbd_device *device = gd->private_data;
 	struct drbd_resource *resource = device->resource;
-	bool was_writable;
 	int open_rw_cnt, open_ro_cnt;
 
+	/* This is a workaround for kernels that do not pass in the fmode_t argument.*/
+	fmode_t mode = device->open_ro_cnt ? FMODE_READ : FMODE_WRITE;
+
 	mutex_lock(&resource->open_release);
-	was_writable = device->writable;
-	device->open_cnt--;
+	if (mode & FMODE_WRITE)
+		device->open_rw_cnt--;
+	else
+		device->open_ro_cnt--;
+
 	drbd_open_counts(resource, &open_rw_cnt, &open_ro_cnt);
 
-	/* Last one to close will be responsible for write-out of all dirty pages.
-	 * We also reset the writable flag for this device here:  later code may
-	 * check if the device is still opened for writes to determine things
-	 * like auto-demote.
-	 * Don't do the "fsync_device" if it was not marked writeable before,
-	 * or we risk a deadlock in drbd_reject_write_early().
-	 */
-	if (was_writable && device->open_cnt == 0) {
+	/* last one to close will be responsible for write-out of all dirty pages */
+	if (mode & FMODE_WRITE && device->open_rw_cnt == 0)
 		drbd_fsync_device(device);
-		device->writable = false;
-	}
 
 	if (open_ro_cnt == 0)
 		wake_up_all(&resource->state_wait);
 
-	if (test_bit(UNREGISTERED, &device->flags) && device->open_cnt == 0 &&
+	if (test_bit(UNREGISTERED, &device->flags) &&
+	    device->open_rw_cnt == 0 && device->open_ro_cnt == 0 &&
 	    !test_and_set_bit(DESTROYING_DEV, &device->flags))
 		call_rcu(&device->rcu, drbd_reclaim_device);
 
@@ -3003,11 +2997,12 @@ static void drbd_release(struct gendisk *gd)
 		end_state_change(resource, &irq_flags, "release");
 	}
 
-	/* if the open count is 0, we free the whole list, otherwise we remove the specific pid */
-	prune_or_free_openers(device, (device->open_cnt == 0) ? 0 : task_pid_nr(current));
+	/* if the open counts are 0, we free the whole list, otherwise we remove the specific pid */
+	prune_or_free_openers(device,
+			(open_ro_cnt == 0 && open_rw_cnt == 0) ? 0 : task_pid_nr(current));
 	if (open_rw_cnt == 0 && open_ro_cnt == 0 && resource->auto_promoted_by.pid != 0)
 		memset(&resource->auto_promoted_by, 0, sizeof(resource->auto_promoted_by));
-	if (device->open_cnt == 0) {
+	if (open_ro_cnt == 0 && open_rw_cnt == 0) {
 		struct device_info info;
 
 		device_to_info(&info, device);
